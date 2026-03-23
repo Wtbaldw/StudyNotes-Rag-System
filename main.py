@@ -191,21 +191,21 @@ async def upload_pdf(pdf: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Could not extract text from PDF. It may be scanned/image-based.")
             
         async def process_chunk(i, chunk_data):
-            chunk_text = chunk_data["text"]
+            chunk_str = chunk_data["text"]
             page_num = chunk_data["pageNumber"]
-            embedding = await get_embedding(chunk_text)
-            return (i, page_num, chunk_text, embedding)
+            embedding = await get_embedding(chunk_str)
+            return (i, page_num, chunk_str, embedding)
 
         processed = await asyncio.gather(*(process_chunk(i, c) for i, c in enumerate(all_chunks)))
         
-        for i, page_num, chunk_text, embedding in processed:
+        for i, page_num, chunk_str, embedding in processed:
             vector_store.add(
                 f"{docId}_chunk_{i}",
                 docId,
                 pdf.filename,
                 i,
                 page_num,
-                chunk_text,
+                chunk_str,
                 embedding
             )
 
