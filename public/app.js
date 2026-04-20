@@ -77,7 +77,7 @@ async function uploadFile(file) {
 
     const data = await res.json();
 
-    if (!res.ok) throw new Error(data.error || 'Upload failed');
+    if (!res.ok) throw new Error(data.error || data.detail || 'Upload failed');
 
     progressFill.style.width = '100%';
     progressText.textContent = 'Done!';
@@ -147,7 +147,7 @@ async function deleteDocument(docId) {
     const res = await fetch(`/api/documents/${docId}`, { method: 'DELETE' });
     const data = await res.json();
 
-    if (!res.ok) throw new Error(data.error || 'Delete failed');
+    if (!res.ok) throw new Error(data.error || data.detail || 'Delete failed');
 
     showToast(data.message, 'success');
     loadDocuments();
@@ -199,7 +199,7 @@ chatForm.addEventListener('submit', async (e) => {
     });
 
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Chat failed');
+    if (!res.ok) throw new Error(data.error || data.detail || 'Chat failed');
 
     // Remove typing indicator
     typingEl.remove();
