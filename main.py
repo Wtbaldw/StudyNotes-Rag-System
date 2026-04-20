@@ -2,6 +2,7 @@ import os
 import uuid
 import json
 import math
+import asyncio
 import requests
 import numpy as np
 from datetime import datetime
@@ -10,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from pypdf import PdfReader
+import fitz
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -24,16 +26,20 @@ app.add_middleware(
 )
 
 UPLOAD_DIR = "uploads"
+PAGES_DIR = os.path.join("public", "pages")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(PAGES_DIR, exist_ok=True)
 
 OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "llama3.2")
 
 # --- Ollama API Helpers ---
-def get_embedding(text: str) -> List[float]:
+async def get_embedding(text: str) -> List[float]:
     try:
-        res = requests.post(f"{OLLAMA_BASE}/api/embed", json={"model": EMBED_MODEL, "input": text})
+        res = await asyncio.to_thread(
+            requests.post, f"{OLLAMA_BASE}/api/embed", json={"model": EMBED_MODEL, "input": text}
+        )
         res.raise_for_status()
         return res.json().get("embeddings")[0]
     except Exception as e:
@@ -88,12 +94,13 @@ class VectorStore:
     def __init__(self):
         self.entries = []
     
-    def add(self, id, docId, docName, chunkIndex, text, embedding):
+    def add(self, id, docId, docName, chunkIndex, pageNumber, text, embedding):
         self.entries.append({
             "id": id,
             "docId": docId,
             "docName": docName,
             "chunkIndex": chunkIndex,
+            "pageNumber": pageNumber,
             "text": text,
             "embedding": np.array(embedding)
         })
@@ -114,10 +121,22 @@ class VectorStore:
             return []
         
         qe = np.array(query_embedding)
+        all_embeddings = np.array([e["embedding"] for e in self.entries])
+        
+        # Vectorized cosine similarity
+        mags = np.linalg.norm(all_embeddings, axis=1)
+        qe_mag = np.linalg.norm(qe)
+        
+        valid_mask = (mags != 0) & (qe_mag != 0)
+        scores = np.zeros(len(self.entries))
+        
+        if qe_mag != 0:
+            dots = np.dot(all_embeddings, qe)
+            scores[valid_mask] = dots[valid_mask] / (mags[valid_mask] * qe_mag)
+            
         scored = []
-        for e in self.entries:
-            score = self.cosine(qe, e["embedding"])
-            scored.append({**e, "score": score})
+        for i, e in enumerate(self.entries):
+            scored.append({**e, "score": float(scores[i])})
             
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:top_k]
@@ -147,36 +166,53 @@ async def upload_pdf(pdf: UploadFile = File(...)):
             
         # Parse PDF
         reader = PdfReader(file_path)
-        text = ""
-        for page in reader.pages:
+        doc_fitz = fitz.open(file_path)
+        all_chunks = []
+        for page_num, page in enumerate(reader.pages):
+            # Render image of the page
+            fitz_page = doc_fitz[page_num]
+            pix = fitz_page.get_pixmap(matrix=fitz.Matrix(2, 2))  # Higher resolution matrix
+            image_path = os.path.join(PAGES_DIR, f"{docId}_page_{page_num + 1}.png")
+            pix.save(image_path)
+            
             extr = page.extract_text()
             if extr:
-                text += extr + "\n"
+                page_chunks = chunk_text(extr)
+                for chunk in page_chunks:
+                    all_chunks.append({
+                        "pageNumber": page_num + 1,
+                        "text": chunk
+                    })
                 
-        if not text.strip():
+        doc_fitz.close()
+                
+        if not all_chunks:
             os.remove(file_path)
             raise HTTPException(status_code=400, detail="Could not extract text from PDF. It may be scanned/image-based.")
             
-        chunks = chunk_text(text)
-        if not chunks:
-            os.remove(file_path)
-            raise HTTPException(status_code=400, detail="No text content found in PDF")
+        async def process_chunk(i, chunk_data):
+            chunk_str = chunk_data["text"]
+            page_num = chunk_data["pageNumber"]
+            embedding = await get_embedding(chunk_str)
+            return (i, page_num, chunk_str, embedding)
 
-        for i, chunk in enumerate(chunks):
-            embedding = get_embedding(chunk)
+        processed = await asyncio.gather(*(process_chunk(i, c) for i, c in enumerate(all_chunks)))
+        
+        for i, page_num, chunk_str, embedding in processed:
             vector_store.add(
                 f"{docId}_chunk_{i}",
                 docId,
                 pdf.filename,
                 i,
-                chunk,
+                page_num,
+                chunk_str,
                 embedding
             )
 
         documents[docId] = {
             "name": pdf.filename,
             "filename": filename,
-            "chunkCount": len(chunks),
+            "chunkCount": len(all_chunks),
             "pages": len(reader.pages),
             "uploadedAt": datetime.now().isoformat()
         }
@@ -187,7 +223,7 @@ async def upload_pdf(pdf: UploadFile = File(...)):
             "success": True,
             "docId": docId,
             "name": pdf.filename,
-            "chunks": len(chunks),
+            "chunks": len(all_chunks),
             "pages": len(reader.pages)
         }
 
@@ -215,18 +251,18 @@ async def chat(request: ChatRequest):
             "sources": []
         }
 
-    question_embedding = get_embedding(question)
+    question_embedding = await get_embedding(question)
     results = vector_store.query(question_embedding, 5)
 
     context = "\n\n---\n\n".join([
-        f"[Source: {r['docName']}, Chunk {r['chunkIndex'] + 1} (similarity: {r['score']:.3f})]\n{r['text']}" 
+        f"[Source: {r['docName']}, Page {r['pageNumber']} (similarity: {r['score']:.3f})]\n{r['text']}" 
         for r in results
     ])
 
     system_prompt = (
         "You are a helpful study assistant. Answer the student's question based ONLY on the provided context from their uploaded documents. "
         "If the context doesn't contain enough information to answer the question, say so honestly. "
-        "Always cite which document the information comes from when possible. "
+        "Always cite which document and page number the information comes from when possible. "
         "Be clear, concise, and educational in your responses. "
         "Format your responses with markdown for readability."
     )
@@ -237,7 +273,18 @@ async def chat(request: ChatRequest):
     }]
 
     answer = chat_with_ollama(messages)
-    sources = list(set([r["docName"] for r in results]))
+    
+    unique_sources = {}
+    for r in results:
+        key = f"{r['docId']}_{r['pageNumber']}"
+        if key not in unique_sources:
+            unique_sources[key] = {
+                "name": r['docName'],
+                "page": r['pageNumber'],
+                "image": f"/pages/{r['docId']}_page_{r['pageNumber']}.png"
+            }
+            
+    sources = list(unique_sources.values())
 
     return {"answer": answer, "sources": sources, "chunks_used": len(results)}
 
@@ -255,6 +302,12 @@ async def delete_document(doc_id: str):
     vector_store.delete_by_doc_id(doc_id)
     del documents[doc_id]
     
+    # Clean up images
+    for i in range(doc["pages"]):
+        img_path = os.path.join(PAGES_DIR, f"{doc_id}_page_{i + 1}.png")
+        if os.path.exists(img_path):
+            os.remove(img_path)
+            
     return {"success": True, "message": f"Deleted \"{doc['name']}\""}
 
 
